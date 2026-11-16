@@ -72,7 +72,7 @@ const TOOLS_AUTH = [
   { name: 'mcp__plugin_acme_linear__authenticate', description: '', mcp: true },
 ]
 
-type World = { refuse?: string; breakdown: any; rateLimits: any[]; search: unknown; tools: unknown[]; now: number; authText: string; reconnectText: string; epics?: Record<number, string>; mcpFail?: '' | 'throw' | 'error'; draft?: string }
+type World = { refuse?: string; breakdown: any; rateLimits: any[]; search: unknown; tools: unknown[]; now: number; authText: string; reconnectText: string; epics?: Record<number, string>; mcpFail?: '' | 'throw' | 'error'; draft?: string; usageFail?: boolean }
 
 // Stands for the engine beneath the mod; records what the mod asked of it.
 function engine(on: any, w: World, store: Record<string, unknown> = {}) {
@@ -88,7 +88,10 @@ function engine(on: any, w: World, store: Record<string, unknown> = {}) {
   on('turn.complete', () => ({ text: '' }))
   on('store.get', (_$: any, e: any) => ({ value: store[e.key] }))
   on('store.set', (_$: any, e: any) => ((store[e.key] = e.value), { value: undefined }))
-  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: w.breakdown.totalTokens, window: 1_000_000, percent: w.breakdown.percentage, breakdown: w.breakdown }, rateLimits: w.rateLimits, cost: { usd: 0 } } }))
+  on('session.usage', () => {
+    if (w.usageFail) throw new Error('usage down')
+    return { value: { startedAt: 0, context: { tokens: w.breakdown.totalTokens, window: 1_000_000, percent: w.breakdown.percentage, breakdown: w.breakdown }, rateLimits: w.rateLimits, cost: { usd: 0 } } }
+  })
   const clock = mock.clock(on, { now: w.now }) // waits are held until a test moves the clock
   on('tool.list', () => ({ value: w.tools }))
   on('ui.toast', (_$: any, e: any) => (toasts.push(e.text), { value: undefined }))
@@ -696,6 +699,71 @@ describe('integral: preshow of pasted images (serg/tasks#1955)', () => {
     await started($, on, { draft: 'resume with [Image #7] already here' })
     const band = await mount($)
     expect(await band.find({ type: 'Text', text: '[Image #7]' })).toBeDefined()
+    await band.unmount()
+  })
+})
+
+// serg/tasks#3045: a check or refresh that did not happen is not shown as a fresh, healthy one.
+describe('integral: failed checks are visible (serg/tasks#3045)', () => {
+  test('a refused ToolSearch probe keeps the last report and says the check failed', async ($, on) => {
+    const { world } = await started($, on, { search: SEARCH_BROKEN })
+    world.refuse = 'ToolSearch'
+    const text = (await $.command.run({ command: 'integral', args: 'mcp check' } as any)).text!
+    expect(text).toMatch(/check failed/)
+    expect(text).toMatch(/2 failed/) // not overwritten with an empty list
+    expect(text).not.toMatch(/0 failed/)
+    const band = await mount($, 160)
+    expect(await band.find({ key: 'reconnect:coord' })).toBeDefined() // the last known failure stays
+    expect(await band.find({ key: 'check:mcp' })).toBeDefined() // and the row says the check itself failed
+    await band.unmount()
+    world.refuse = ''
+    const again = (await $.command.run({ command: 'integral', args: 'mcp check' } as any)).text!
+    expect(again).not.toMatch(/check failed/)
+  })
+
+  test('a probe refused from the start is not read as all servers fine', async ($, on) => {
+    await started($, on, { refuse: 'ToolSearch' })
+    const text = (await $.command.run({ command: 'integral', args: 'mcp' } as any)).text!
+    expect(text).toMatch(/check failed/)
+    expect(text).not.toMatch(/0 failed/)
+    const band = await mount($)
+    expect(await band.find({ key: 'check:mcp' })).toBeDefined()
+    await band.unmount()
+  })
+
+  test('a failed context refresh marks the percentage as stale; the next good one clears it', async ($, on) => {
+    const { world } = await started($, on)
+    let band = await mount($)
+    expect(await band.find({ type: 'Text', text: '?' })).toBeUndefined()
+    await band.unmount()
+    world.usageFail = true
+    await $.command.run({ command: 'integral', args: '' } as any) // hide
+    await $.command.run({ command: 'integral', args: '' } as any) // show: refreshes, and fails
+    band = await mount($)
+    expect(await band.find({ type: 'Button', label: '46%' })).toBeDefined() // the last reading stays
+    expect(await band.find({ type: 'Text', text: '?' })).toBeDefined() // marked as stale
+    await band.unmount()
+    world.usageFail = false
+    await $.command.run({ command: 'integral', args: '' } as any)
+    await $.command.run({ command: 'integral', args: '' } as any)
+    band = await mount($)
+    expect(await band.find({ type: 'Text', text: '?' })).toBeUndefined()
+    await band.unmount()
+  })
+
+  test('a failed task_get marks the epic row as stale', async ($, on) => {
+    const rec = await started($, on, { epics: EPICS })
+    await $.command.run({ command: 'integral', args: 'plan epic 1556' } as any)
+    let band = await mount($)
+    expect(await band.find({ type: 'Text', text: '3/11' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: '?' })).toBeUndefined()
+    await band.unmount()
+    rec.world.mcpFail = 'error'
+    await rec.clock.advance(120_000)
+    await settle()
+    band = await mount($)
+    expect(await band.find({ type: 'Text', text: '3/11' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: '?' })).toBeDefined()
     await band.unmount()
   })
 })
