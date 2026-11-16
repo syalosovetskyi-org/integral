@@ -15,13 +15,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, Timer } from 'claude-code'
 
-import type { Board, Epic, Limit, Reading, Report } from '../types'
+import type { Board, Epic, Limit, Reading, Report, Stale } from '../types'
 import { contextRow, legend, legendHead, legendParts, nextPick, toLimits, toReading } from './context'
 import type { Part } from './context'
 import { TASKS_PREFIX, TASKS_SERVER, epicRow, issueNumber, parseTask, textOf, withInfo } from './epic'
 import type { TaskInfo } from './epic'
 import { statusLayout } from './layout'
-import { MCP_COLOR, MCP_GLYPH, MCP_HEAD, findUrl, isRefusal, parseSearch, parseTools, problemsOf, reconnectName, shortName, summary } from './mcp'
+import { MCP_COLOR, MCP_GLYPH, MCP_HEAD, checkProblem, findUrl, isRefusal, parseSearch, probeError, parseTools, problemsOf, reconnectName, shortName, summary } from './mcp'
 import type { Problem } from './mcp'
 import { PLAN_TOOLS, addTask, fromTodos, planRow, updateTask } from './plan'
 import { imagesOf, preshowRow } from './preshow'
@@ -51,6 +51,7 @@ const board = atom({ plugin: 'integral', key: 'board' } as const, null as Board 
 const isPlanHidden = atom({ plugin: 'integral', key: 'isPlanHidden' } as const, false)
 const epic = atom({ plugin: 'integral', key: 'epic' } as const, null as Epic | null)
 const preshow = atom({ plugin: 'integral', key: 'preshow' } as const, null as string[] | null)
+const stale = atom({ plugin: 'integral', key: 'stale' } as const, {} as Stale)
 
 function errText(err: unknown) {
   return err instanceof Error ? err.message : String(err)
@@ -61,16 +62,38 @@ function trace($: EngineInterface, what: string, err: unknown) {
   $.ui.log(`${PLUGIN}: ${what}: ${errText(err)}`, { to: 'debug' })
 }
 
+// A section's last refresh or check did not land: it keeps its last data, and the HUD marks it
+// (dim `?`) instead of showing old data as current (serg/tasks#3045). A success clears the mark.
+async function markStale($: EngineInterface, key: keyof Stale, err: unknown) {
+  const at = await $.clock.now().catch(() => Date.now()) // the clock failing too must not hide the mark
+  await update($, stale, s => ({ ...s, [key]: { at, error: errText(err).slice(0, 200) } }))
+}
+
+async function markFresh($: EngineInterface, key: keyof Stale) {
+  if (!(await read($, stale))[key]) return // no redraw when nothing changes
+  await update($, stale, s => {
+    const { [key]: _, ...rest } = s
+    return rest
+  })
+}
+
 // ---------- context ----------
 
 // Asks the engine for /context's breakdown, estimated locally (no token-count calls).
 async function refresh($: EngineInterface) {
   if (await read($, isHidden)) return
-  const usage = await $.session.usage({ breakdown: 'summary' })
+  let usage
+  try {
+    usage = await $.session.usage({ breakdown: 'summary' })
+  } catch (err) {
+    await markStale($, 'context', err)
+    throw err // the caller traces it
+  }
   await update($, limits, () => toLimits(usage.rateLimits ?? [])) // empty off a subscription
   const b = usage.context.breakdown
   if (!b || !(b.rawMaxTokens > 0)) return // no window to measure against: the HUD keeps its last reading
   await update($, reading, () => toReading(b))
+  await markFresh($, 'context')
 }
 
 // The two actions. Each is a queued call the engine runs once the session is idle; a refusal is told, not dropped.
@@ -96,13 +119,18 @@ async function check($: EngineInterface): Promise<Report | null> {
         $.tool.list(),
         $.clock.now(),
       ])
+      // A denied or failed probe carries no server lists: the last report stays, marked as unchecked.
+      const refused = probeError(search as { deny?: string; isError?: boolean; text?: string; result?: unknown })
+      if (refused) throw new Error(`ToolSearch ${refused}`)
       const s = parseSearch('result' in search ? search.result : undefined)
       const t = parseTools(tools)
       const r: Report = { checkedAt: now, connected: t.connected, failed: s.failed, needsAuth: t.needsAuth, pending: s.pending }
       await update($, report, () => r)
+      await markFresh($, 'mcp')
       return r
     } catch (err) {
-      trace($, 'mcp check', err) // the row keeps its last report; /integral mcp says the check failed
+      trace($, 'mcp check', err) // the row keeps its last report, with a `? MCP check failed` item; /integral mcp says so
+      await markStale($, 'mcp', err).catch(e => trace($, 'mark mcp stale', e))
       return null
     } finally {
       inflight = undefined
@@ -153,8 +181,8 @@ async function authenticate($: EngineInterface, seg: string) {
   $.ui.toast(`MCP ${shortName(seg)}: браузер открыт, после логина нажми reconnect`)
 }
 
-function press($: EngineInterface, p: Problem, action: 'reconnect' | 'auth') {
-  const run = action === 'auth' ? authenticate($, p.name) : reconnect($, p.kind === 'auth' ? reconnectName(p.name) : p.name)
+function press($: EngineInterface, p: Problem, action: Problem['action']) {
+  const run = action === 'check' ? check($) : action === 'auth' ? authenticate($, p.name) : reconnect($, p.kind === 'auth' ? reconnectName(p.name) : p.name)
   void run.catch(err => trace($, `${action} ${p.name}`, err))
 }
 
@@ -201,12 +229,16 @@ async function refreshEpic($: EngineInterface): Promise<void> {
       const text = textOf(res.content)
       const info = res.isError ? null : parseTask(text)
       if (!info) {
-        $.ui.log(`${PLUGIN}: epic #${cur.n}: task_get ${res.isError ? 'error' : 'unparsed'}: ${text.slice(0, 200)}`, { to: 'debug' })
+        const why = `task_get ${res.isError ? 'error' : 'unparsed'}: ${text.slice(0, 200)}`
+        $.ui.log(`${PLUGIN}: epic #${cur.n}: ${why}`, { to: 'debug' })
+        await markStale($, 'epic', why)
         return
       }
       await update($, epic, e => (e && e.n === info.n ? withInfo(e, info) : e)) // switched meanwhile: that one fetches its own
+      await markFresh($, 'epic')
     } catch (err) {
-      trace($, `epic #${cur.n} task_get`, err) // the row keeps the last data
+      trace($, `epic #${cur.n} task_get`, err) // the row keeps the last data, marked stale
+      await markStale($, 'epic', err).catch(e => trace($, 'mark epic stale', e))
     }
   })().finally(() => {
     epicInflight = undefined
@@ -223,6 +255,7 @@ async function setEpic($: EngineInterface, n: number, isExplicit: boolean, info?
     const base: Epic = cur && cur.n === n ? { ...cur, isExplicit } : { n, isExplicit, title: '', done: 0, total: 0 }
     return info && info.n === n ? withInfo(base, info) : base
   })
+  if (changed) await markFresh($, 'epic') // another epic: the old one's failure is not its
   if (changed && !info) await refreshEpic($)
 }
 
@@ -404,10 +437,8 @@ export const register: Register = on => {
       return { text: open ? 'integral: full legend' : 'integral: compact' }
     }
     if (cmd === 'mcp') {
-      const fresh = arg === 'check' || !(await read($, report))
-      const ok = fresh ? await check($) : true
-      const text = summary(await read($, report), await $.clock.now(), await read($, startedAt))
-      return { text: ok ? text : `MCP: check failed (see claude --debug).\n${text}` }
+      if (arg === 'check' || !(await read($, report))) await check($) // a failed check lands in `stale`, which summary shows
+      return { text: summary(await read($, report), await $.clock.now(), await read($, startedAt), (await read($, stale)).mcp) }
     }
     if (cmd === 'plan' && (arg === 'off' || arg === 'on')) {
       const off = arg === 'off'
@@ -418,6 +449,7 @@ export const register: Register = on => {
     if (cmd === 'plan' && arg === 'epic') {
       if (arg2 === 'off') {
         await update($, epic, () => null)
+        await markFresh($, 'epic')
         return { text: 'integral: epic cleared; task_add with a parent or task_get of an epic sets one again' }
       }
       const n = issueNumber(arg2)
@@ -442,6 +474,7 @@ export const register: Register = on => {
     // Row 1: context.
     const r = await read($, reading)
     const open = await read($, isExpanded)
+    const st = await read($, stale)
     try {
       if (r) {
         const row = contextRow(r, inner, await read($, picked))
@@ -455,6 +488,11 @@ export const register: Register = on => {
             <Box flexShrink={0} marginLeft={1}>
               <Button key="pct" plain label={row.label} hover={{ scope: 'integral-pct', color: row.level, bold: true }} onPress={() => update($, picked, cur => nextPick(r, cur))} />
             </Box>
+            {st.context && (
+              <Box flexShrink={0}>
+                <Text dimColor>?</Text>
+              </Box>
+            )}
             <Box flexShrink={0} marginLeft={1}>
               {icon('legend', open ? '<' : '>', () => void update($, isExpanded, x => !x).catch(err => trace($, 'legend toggle', err)))}
             </Box>
@@ -479,6 +517,7 @@ export const register: Register = on => {
       let problems: Problem[] = []
       try {
         problems = problemsOf(await read($, report), now, await read($, startedAt))
+        if (st.mcp) problems = [checkProblem(st.mcp), ...problems] // the servers' state is unknown, not fine
       } catch (err) {
         trace($, 'render mcp', err) // the row keeps its limit bars
       }
@@ -573,6 +612,11 @@ export const register: Register = on => {
             <Box flexShrink={0} marginLeft={1}>
               <Text>{p.count}</Text>
             </Box>
+            {st.epic && (
+              <Box flexShrink={0} marginLeft={1}>
+                <Text dimColor>?</Text>
+              </Box>
+            )}
             {p.ref && (
               <Box flexShrink={0} marginLeft={2}>
                 <Text dimColor>{p.ref}</Text>

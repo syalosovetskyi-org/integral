@@ -1,22 +1,22 @@
 // MCP section, pure parts (carried over from mcp-doctor): which servers are broken.
 //   Status comes from ToolSearch (`pending_mcp_servers`, `failed_mcp_servers`, any query, no prompt)
 //   and tool.list (a server needing OAuth exposes `mcp__<srv>__authenticate`).
-import type { Failed, Report } from '../types'
+import type { Failed, Failure, Report } from '../types'
 
 export const GRACE_MS = 60_000 // pending is not a problem this long after session start
 export const MCP_HEAD = 'MCP  ' // the row's head when no limit bars stand before the items
 
-export type Kind = 'failed' | 'auth' | 'pending'
+export type Kind = 'failed' | 'auth' | 'pending' | 'unchecked'
 export type Problem = {
   kind: Kind
   name: string // what /mcp reconnect takes (failed, pending) or the tool-name segment (auth)
   label: string // what the row shows
-  action: 'reconnect' | 'auth'
+  action: 'reconnect' | 'auth' | 'check'
   detail?: string
 }
 
-export const MCP_GLYPH: Record<Kind, string> = { failed: '✕', auth: '🔑', pending: '…' }
-export const MCP_COLOR: Record<Kind, string> = { failed: 'error', auth: 'warning', pending: 'warning' }
+export const MCP_GLYPH: Record<Kind, string> = { failed: '✕', auth: '🔑', pending: '…', unchecked: '?' }
+export const MCP_COLOR: Record<Kind, string> = { failed: 'error', auth: 'warning', pending: 'warning', unchecked: 'warning' }
 
 // ToolSearch's `result`: the two server lists, whatever else it carries.
 export function parseSearch(result: unknown): { pending: string[]; failed: Failed[] } {
@@ -32,6 +32,19 @@ export function parseSearch(result: unknown): { pending: string[]; failed: Faile
     }
   }
   return { pending, failed }
+}
+
+// The ToolSearch probe's answer is a server list only when the call ran: a deny or an error
+// result carries none, and reading it as empty lists would show every server as fine (serg/tasks#3045).
+export function probeError(res: { deny?: string; isError?: boolean; text?: string; result?: unknown }): string | null {
+  if (typeof res.deny === 'string' && res.deny) return `denied: ${res.deny}`
+  if (res.isError) return `error: ${(res.text || (typeof res.result === 'string' ? res.result : '') || 'ToolSearch failed').slice(0, 200)}`
+  return null
+}
+
+// The row item for a check that failed: the servers' state is unknown, not fine.
+export function checkProblem(f: Failure): Problem {
+  return { kind: 'unchecked', name: 'mcp', label: 'MCP check failed', action: 'check', detail: f.error }
 }
 
 // tool.list: servers with tools, and those whose `authenticate` tool says they wait for a login.
@@ -120,9 +133,12 @@ export function isRefusal(text: string | undefined) {
   return /not (available|supported)|unknown command|isn't available|cannot|can't|only in|interactive|failed|error/i.test(text)
 }
 
-export function summary(r: Report | null, now: number, started: number): string {
-  if (!r) return 'MCP: no check yet. /integral mcp check checks now.'
-  const t = new Date(r.checkedAt).toTimeString().slice(0, 8)
+const hhmm = (at: number) => new Date(at).toTimeString().slice(0, 8)
+
+export function summary(r: Report | null, now: number, started: number, failure?: Failure): string {
+  const failed = failure ? `MCP: last check failed at ${hhmm(failure.at)}: ${failure.error}` : ''
+  if (!r) return failed ? `${failed}\nNo report yet. /integral mcp check checks again.` : 'MCP: no check yet. /integral mcp check checks now.'
+  const t = hhmm(r.checkedAt)
   const inGrace = now - started < GRACE_MS
   const auth = r.needsAuth
   const lines = [`MCP: ${r.connected.length} connected, ${r.failed.length} failed, ${auth.length} need auth, ${r.pending.length} pending (checked ${t})`]
@@ -130,5 +146,6 @@ export function summary(r: Report | null, now: number, started: number): string 
   for (const s of auth) lines.push(`  🔑 ${shortName(s)}  (${s}) needs a login: press auth in the row`)
   if (r.pending.length) lines.push(`  … pending${inGrace ? ' (session start, not counted yet)' : ''}: ${r.pending.join(', ')}`)
   if (r.connected.length) lines.push(`  ✓ ${r.connected.join(', ')}`)
+  if (failed) lines.unshift(`${failed}. The report below is the last good one.`)
   return lines.join('\n')
 }

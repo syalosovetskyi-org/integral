@@ -25,6 +25,10 @@ export type Report = {
   pending: string[] // still connecting, by configured name
 }
 
+// The last attempt that did not land (serg/tasks#3045): the section keeps its last data, marked stale.
+export type Failure = { at: number; error: string }
+export type Stale = { context?: Failure; mcp?: Failure; epic?: Failure }
+
 // ---- plan ----
 export type ItemStatus = 'pending' | 'in_progress' | 'completed'
 
@@ -56,6 +60,7 @@ declare module 'claude-code' {
       isPlanHidden: boolean
       epic: Epic | null
       preshow: string[] | null // the `[Image #N]` placeholders of the current draft, in order
+      stale: Stale // the sections whose last refresh or check failed
     }
   }
 }
